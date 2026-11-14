@@ -242,10 +242,10 @@ EOF
   say "reviewer: $reviewer (writer was $writer)"
   local out rc; out=$(harness_run "$reviewer" read "$pf" "$wt" 2>&1); rc=$?
   # Backup reviewer: when the first harness gives no verdict (missing, offline, expired auth),
-  # re-run on pi with the local model qwen3.8-flash-next. Only a no-verdict run triggers it.
+  # re-run on pi with the default model (HK_MODEL). Only a no-verdict run triggers it.
   if ! printf '%s\n' "$out" | grep -qi 'STATUS: *\(APPROVED\|REJECTED\)'; then
     if [ "$reviewer" != pi ]; then
-      say "reviewer $reviewer gave no verdict (exit $rc); falling back to pi on ${HK_REVIEW_MODEL:-qwen3.8-flash-next}"
+      say "reviewer $reviewer gave no verdict (exit $rc); falling back to pi on ${HK_REVIEW_MODEL:-$HK_MODEL}"
       reviewer=pi; out=$(harness_run pi read "$pf" "$wt" 2>&1); rc=$?
     fi
   fi
