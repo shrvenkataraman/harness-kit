@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+HERE=$(cd "$(dirname "$0")" && pwd)
 # Layout test: base_dir, work_dir and archive_dir from policy.json drive every hk folder.
 set -uo pipefail
 HK=${HK:-$(realpath "$(dirname "$0")/../hk")}
@@ -49,7 +50,7 @@ else
 fi
 
 # AC1: the main suite still passes with the default layout
-if bash "$(dirname "$0")/run_tests.sh" >/dev/null 2>&1; then echo "PASS  AC1: run_tests.sh passes"; else echo "FAIL  AC1: run_tests.sh failed"; fails=$((fails+1)); fi
+if env -u HK_ROOT -u HK_POLICY -u HK_DIR -u HK_STUB_CMD -u HK_HARNESS_DIR bash "$HERE/run_tests.sh" >/dev/null 2>&1; then echo "PASS  AC1: run_tests.sh passes"; else echo "FAIL  AC1: run_tests.sh failed"; fails=$((fails+1)); fi
 
 rm -rf "$TMP"
 [ "$fails" -eq 0 ] && exit 0
