@@ -1,0 +1,603 @@
+#!/usr/bin/env bash
+# hk — harness kit. One tool, five rules, every harness.
+# Commands: new, worker, verify, review, close, archive, install, status
+set -uo pipefail
+
+HK_BIN=$(realpath "$0"); HK_DIR=$(dirname "$HK_BIN")
+# shellcheck source=lib.sh
+. "$HK_DIR/lib.sh"
+need git; need jq; need sha256sum
+
+MAX_LINES="${HK_MAX_LINES:-150}"
+MAX_FILES="${HK_MAX_FILES:-5}"
+
+usage() {
+  cat <<'EOF'
+hk — harness kit
+
+  hk new <ticket.md> [--repo R] [--base B]   contract + worktree in features/
+  hk new --task N --repo R --check CMD       same, without a ticket file (for hooks)
+  hk worker [ticket.md] [--harness pi]       one headless session, then verify
+  hk verify [--wt <path>]                    run the checks, write receipt.json
+  hk review [--wt <path>]                    second harness attacks the diff
+  hk close [--commit] [--push] [--sync]      re-verify, compare hash, then act
+  hk archive <task> [--apply]                git worktree move into archives/
+  hk install [--repo R|--all] [--apply]      write the git hook, print harness hooks
+  hk status                                  contracts, receipts and verdicts
+  hk check [worktree]                         the rule the hooks run: receipt + review + hash
+  hk adopt [worktree]                         write a contract for a worktree made without hk
+  hk audit                                    worktrees that break the layout or branch standard
+  hk repair <task> [--apply]                  move and rename one worktree to the standard
+  hk policy [get <k>|set <k> <v>]             read or change the standard in policy.json
+
+Layout: repos/<repo> base checkout, features/<task> worktree, archives/<task> after merge.
+Read .agent/contract.json for the rules of the worktree you are standing in.
+EOF
+}
+
+# ---------------- hk new ----------------
+cmd_new() {
+  local ticket="" repo="" base="" task="" check="" branch=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="$2"; shift 2 ;;
+      --base) base="$2"; shift 2 ;;
+      --task) task="$2"; shift 2 ;;
+      --branch) branch="$2"; shift 2 ;;
+      --check) check="$2"; shift 2 ;;
+      *) [ -z "$ticket" ] && ticket="$1"; shift ;;
+    esac
+  done
+  # Two ways in: a ticket file, or a name plus a check command (the path a hook takes).
+  if [ -n "$ticket" ] && [ ! -f "$ticket" ]; then die "no such ticket: $ticket"; fi
+  if [ -z "$ticket" ] && [ -z "$task" ]; then
+    die "usage: hk new <ticket.md>, or hk new --task <name> --repo <R> [--check <command>]"
+  fi
+  [ -n "$ticket" ] && ticket=$(realpath "$ticket")
+  local checks_json
+  if [ -n "$ticket" ]; then
+    task=$(task_id_from "$ticket")
+    checks_json=$(ticket_checks "$ticket" | jq -R . | jq -s .)
+  else
+    if [ -n "$check" ]; then checks_json=$(printf '%s\n' "$check" | jq -R . | jq -s .); else checks_json='[]'; fi
+  fi
+  [ -z "$repo" ] && repo=$(ticket_field "${ticket:-/dev/null}" Repo)
+  [ -z "$repo" ] && { cd "$PWD" && repo=$(git rev-parse --show-toplevel 2>/dev/null) && repo=$(basename "$repo"); }
+  local rd; rd=$(repo_dir "$repo")
+  [ -d "$rd" ] || die "no base checkout at $rd. Expected repos/$repo"
+  if [ "$(jq -r 'length' <<<"$checks_json")" = 0 ]; then
+    local dflt; dflt=$(default_check_for "$rd")
+    [ -n "$dflt" ] && checks_json=$(printf '%s\n' "$dflt" | jq -R . | jq -s .) \
+      && say "check from the repo default: $dflt"
+  fi
+  local bref; bref=$(base_ref_for "$rd" "$base")
+  local wt; wt=$(worktree_path "$task" "$repo")
+  local br; br=$(branch_for "$task" "$branch")
+  [ -e "$wt" ] && die "$wt already exists. Use another task name, or hk archive first."
+
+  local base_commit; base_commit=$(git -C "$rd" rev-parse "$bref") || die "no ref $bref in $rd"
+  say "worktree: $wt  branch: $br  base: $bref@${base_commit:0:12}"
+  mkdir -p "$(dirname "$wt")"
+  git -C "$rd" worktree add -b "$br" "$wt" "$bref" >/dev/null 2>&1 \
+    || die "git worktree add failed for $wt"
+
+  if [ -f "$rd/.env.example" ] && [ ! -f "$wt/.env" ]; then
+    cp "$rd/.env.example" "$wt/.env" && say "copied .env.example to .env in the worktree"
+  fi
+  exclude_agent_dir "$wt"
+
+  local reads writes
+  reads=$(ticket_field "${ticket:-/dev/null}" Read  | csv_to_lines | jq -R . | jq -s .)
+  writes=$(ticket_field "${ticket:-/dev/null}" Edit | csv_to_lines | jq -R . | jq -s .)
+  mkdir -p "$wt/.agent"
+  jq -n \
+    --arg schema "$HK_VERSION" --arg id "$task" --arg now "$(date -u +%FT%TZ)" \
+    --arg repo "$repo" --arg base "$bref" --arg bc "$base_commit" --arg wt "$wt" \
+    --arg ticket "$ticket" --argjson reads "${reads:-[]}" --argjson writes "${writes:-[]}" \
+    --argjson checks "$checks_json" \
+    --arg maxlines "$MAX_LINES" --arg maxfiles "$MAX_FILES" --arg timeout "${HK_TIMEOUT:-900}" \
+    '{schema_version:$schema, task_id:$id, created_at:$now, repo:$repo, base_ref:$base,
+      base_commit:$bc, worktree:$wt, ticket_file:$ticket,
+      allowed_read:$reads, allowed_write:$writes, check_commands:$checks,
+      max_lines:($maxlines|tonumber), max_files:($maxfiles|tonumber),
+      timeout_seconds:($timeout|tonumber), writer_harness:"unknown"}' \
+    > "$(contract_of "$wt")" || die "could not write the contract"
+
+  ok "contract at $(contract_of "$wt")"
+  cat <<EOF
+
+Next:
+  cd $wt
+  hk worker $ticket --harness pi
+  hk verify && hk review
+EOF
+}
+
+# ---------------- hk verify ----------------
+cmd_verify() {
+  local wt; wt=$(require_worktree)
+  local f; f=$(require_contract "$wt")
+  local base; base=$(jqr '.base_ref' "$f")
+  local maxl maxf tout
+  maxl=$(jqr '.max_lines' "$f"); maxf=$(jqr '.max_files' "$f"); tout=$(jqr '.timeout_seconds' "$f")
+
+  local checks_ok=0 rc all_ok=1 out pass=0 fail=0 checks_json='[]' tail
+  while IFS= read -r check; do
+    [ -z "$check" ] && continue
+    say "check: $check"
+    out=$(cd "$wt" && timeout "${tout:-900}" bash -c "$check" 2>&1); rc=$?
+    tail=$(printf '%s\n' "$out" | tail -25)
+    if [ "$rc" -eq 0 ]; then pass=$((pass+1)); printf '%s\n' "$tail" | tail -3
+    else all_ok=0; fail=$((fail+1)); printf '%s\n' "$tail"; fi
+    checks_json=$(jq --arg e "$check" --argjson rc "$rc" --arg t "$tail" \
+      '. + [{exec:$e, exit_code:$rc, output_tail:$t}]' <<<"$checks_json")
+    checks_ok=$((checks_ok+1))
+  done < <(jqr '.check_commands[]' "$f")
+  if [ "$checks_ok" -eq 0 ]; then
+    all_ok=0
+    say "the contract lists no check command, so nothing proves the work"
+    checks_json=$(jq -n '. + [{exec:"(none)", exit_code:1, output_tail:"hk: add a check to ~/.config/hk/repos.json"}]')
+  fi
+
+  local stats files lines scope_ok=1
+  stats=$(scope_stats "$wt"); files=${stats% *}; lines=${stats#* }
+  [ "${lines:-0}" -gt "$maxl" ] && { scope_ok=0; say "scope: $lines lines over the limit $maxl"; }
+  [ "${files:-0}" -gt "$maxf" ] && { scope_ok=0; say "scope: $files files over the limit $maxf"; }
+
+  local bad="" file writes_re
+  writes_re=$(jqr '[.allowed_write[]?] | join("|")' "$f")
+  while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    case "$file" in .agent/*) continue ;; esac
+    if [ -n "$writes_re" ]; then
+      printf '%s\n' "$file" | grep -qE "$writes_re" || bad="$bad $file"
+    fi
+  done <<<"$(changed_files "$wt")"
+  [ -n "$bad" ] && { scope_ok=0; say "outside the write list:$bad"; }
+
+  local verdict="green"
+  [ "$all_ok" -eq 1 ] && [ "$scope_ok" -eq 1 ] || verdict="red"
+  local writer; writer=$(jqr '.writer_harness' "$f")
+  jq -n --arg id "$(jqr '.task_id' "$f")" --arg now "$(date -u +%FT%TZ)" \
+    --arg v "$verdict" --arg h "$(hostname)" --arg harness "$writer" \
+    --arg dh "$(diff_hash "$wt" "$base")" --arg head "$(git -C "$wt" rev-parse HEAD)" \
+    --arg base "$(jqr '.base_commit' "$f")" --argjson checks "$checks_json" \
+    --argjson pass "$pass" --argjson fail "$fail" \
+    --argjson files "$files" --argjson lines "$lines" --argjson scope "$scope_ok" \
+    '{schema_version:"1", task_id:$id, verified_at:$now, verifier:"hk", host:$h,
+      writer_harness:$harness, verdict:$v, diff_hash:$dh, head_commit:$head, base_commit:$base,
+      checks:$checks, checks_passed:$pass, checks_failed:$fail,
+      files_changed:$files, lines_changed:$lines, scope_ok:($scope==1)}' \
+    > "$(receipt_of "$wt")" || die "could not write the receipt"
+
+  [ "$verdict" = green ] && { ok "receipt green at $(receipt_of "$wt")"; return 0; }
+  say "receipt red at $(receipt_of "$wt")"; return 1
+}
+
+# ---------------- hk worker ----------------
+cmd_worker() {
+  local ticket="" harness="pi"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --harness) harness="$2"; shift 2 ;;
+      *) [ -z "$ticket" ] && ticket="$1"; shift ;;
+    esac
+  done
+  local wt; wt=$(require_worktree)
+  local f; f=$(require_contract "$wt")
+  [ -z "$ticket" ] && ticket=$(jqr '.ticket_file' "$f")
+  [ -n "$ticket" ] && [ -f "$ticket" ] || die "no ticket file; pass one: hk worker <ticket.md>"
+
+  local prompt; prompt=$(mktemp)
+  { printf 'You work in one git worktree. Change only the files listed under Edit.\n'
+    printf 'Make the Check command exit 0, then stop. Make no design decisions.\n\n'
+    cat "$ticket"
+  } > "$prompt"
+
+  say "worker: harness=$harness worktree=$wt"
+  harness_run "$harness" work "$prompt" "$wt"
+  local rc=$?
+  rm -f "$prompt"
+  [ "$rc" -eq 124 ] && say "worker timed out after ${HK_TIMEOUT:-900}s"
+
+  jq --arg h "$harness" '.writer_harness=$h' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  hk_verify_after_worker "$wt"
+}
+
+hk_verify_after_worker() { ( cd "$1" && cmd_verify ); }
+
+# ---------------- hk review ----------------
+cmd_review() {
+  local wt; wt=$(require_worktree)
+  local f r v
+  f=$(require_contract "$wt"); r=$(receipt_of "$wt")
+  [ -f "$r" ] || die "no receipt. Run: hk verify"
+  local verdict; verdict=$(jqr '.verdict' "$r")
+  [ "$verdict" = green ] || die "receipt is $verdict. hk review reads only a green receipt"
+
+  local writer; writer=$(jqr '.writer_harness' "$r")
+  local reviewer; reviewer=$(harness_reviewer) || die "neither opencode nor pi is installed, so hk review cannot run"
+  local base; base=$(jqr '.base_ref' "$f")
+
+  local diff; diff=$(git -C "$wt" diff "$base...HEAD"; git -C "$wt" diff HEAD)
+  local ticket_spec="" ticket_file; ticket_file=$(jqr '.ticket_file' "$f")
+  [ -n "$ticket_file" ] && [ "$ticket_file" != null ] && [ -f "$ticket_file" ] && ticket_spec=$(cat "$ticket_file")
+  local pf; pf=$(mktemp)
+  cat > "$pf" <<EOF
+You audit one git diff against its ticket. You did not write it. Find the reason it fails in production.
+Answer with STATUS: APPROVED or STATUS: REJECTED, then the reason.
+Answer with STATUS plus at most five findings, each under 40 words.
+Check: concurrency, empty and huge input, missing rollback, files outside the write list.
+Rules of the gate: the ticket is the contract. A diff that implements the ticket's Interface,
+Done-when and scope exactly is correct as far as this gate is concerned. Do not REJECT for
+missing features the ticket lists as Out of scope or places in another ticket; note them as
+observations instead. REJECT when the diff deviates from the ticket, breaks in production for
+input the ticket does promise to handle, writes outside the allowed files, or is unsafe for
+concurrency or empty/huge input within the ticket's own promises.
+Ticket:
+$ticket_spec
+Diff:
+$diff
+EOF
+  say "reviewer: $reviewer (writer was $writer)"
+  local out rc; out=$(harness_run "$reviewer" read "$pf" "$wt" 2>&1); rc=$?
+  # Backup reviewer: when the first harness gives no verdict (missing, offline, expired auth),
+  # re-run on pi with the local model qwen3.8-flash-next. Only a no-verdict run triggers it.
+  if ! printf '%s\n' "$out" | grep -qi 'STATUS: *\(APPROVED\|REJECTED\)'; then
+    if [ "$reviewer" != pi ]; then
+      say "reviewer $reviewer gave no verdict (exit $rc); falling back to pi on ${HK_REVIEW_MODEL:-qwen3.8-flash-next}"
+      reviewer=pi; out=$(harness_run pi read "$pf" "$wt" 2>&1); rc=$?
+    fi
+  fi
+  rm -f "$pf"
+
+  local status="UNKNOWN"
+  printf '%s\n' "$out" | grep -qi 'STATUS: *REJECTED' && status="REJECTED"
+  printf '%s\n' "$out" | grep -qi 'STATUS: *APPROVED' && status="APPROVED"
+  jq -n --arg id "$(jqr '.task_id' "$f")" --arg now "$(date -u +%FT%TZ)" \
+    --arg s "$status" --arg rh "$reviewer" --arg wh "$writer" \
+    --arg dh "$(jqr '.diff_hash' "$r")" --argjson rc "$rc" --arg t "$(printf '%s\n' "$out" | tail -40)" \
+    '{schema_version:"1", task_id:$id, reviewed_at:$now, status:$s,
+      reviewer_harness:$rh, writer_harness:$wh, reviewed_diff_hash:$dh,
+      exit_code:$rc, notes_tail:$t}' > "$(review_of "$wt")" || die "could not write review.json"
+
+  [ "$status" = APPROVED ] && { ok "review approved"; return 0; }
+  say "review says $status"; return 1
+}
+
+# ---------------- hk close ----------------
+cmd_close() {
+  local wt; wt=$(require_worktree)
+  local f; f=$(require_contract "$wt")
+  local do_commit=0 do_push=0 do_sync=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --commit) do_commit=1 ;; --push) do_push=1 ;; --sync) do_sync=1 ;;
+      *) die "unknown flag: $1" ;;
+    esac; shift
+  done
+
+  ( cd "$wt" && cmd_verify ) || die "verify failed, nothing closed"
+  local want; want=$(jqr '.diff_hash' "$(receipt_of "$wt")")
+  local now; now=$(diff_hash "$wt" "$(jqr '.base_ref' "$f")")
+  [ "$want" = "$now" ] || die "the diff changed after the receipt ($want != $now). Run hk verify again"
+
+  local rv; rv=$(review_of "$wt")
+  [ -f "$rv" ] || die "no review.json. Run: hk review"
+  local rstat; rstat=$(jqr '.status' "$rv")
+  [ "$rstat" = APPROVED ] || die "review status is $rstat"
+  [ "$(jqr '.reviewed_diff_hash' "$rv")" = "$now" ] || die "the review covers a different diff. Run hk review again"
+  ok "receipt and review both match diff ${now:0:12}"
+
+  if [ "$do_commit" -eq 1 ]; then
+    local id; id=$(jqr '.task_id' "$f")
+    git -C "$wt" commit -am "hk: $id" >/dev/null && ok "committed in $wt"
+  else say "dry run. Add --commit to commit."; fi
+  [ "$do_push" -eq 1 ] && git -C "$wt" push -u origin "HEAD" && ok "pushed the branch"
+  if [ "$do_sync" -eq 1 ]; then
+    local rd; rd=$(repo_dir "$(jqr '.repo' "$f")")
+    local b; b=$(jqr '.base_ref' "$f")
+    git -C "$rd" fetch origin >/dev/null && git -C "$rd" merge --ff-only "origin/$b" && ok "synced $rd to origin/$b"
+  fi
+}
+
+# ---------------- hk archive ----------------
+cmd_archive() {
+  local task="" apply=0
+  while [ $# -gt 0 ]; do
+    case "$1" in --apply) apply=1 ;; *) task="$1" ;; esac; shift
+  done
+  [ -n "$task" ] || die "usage: hk archive <task> [--apply]"
+  # The task folder holds one folder per repo, so find the contract under it.
+  local wt="" cand
+  for cand in "$(hk_root)/$(policy work_dir features)/$task"/*; do
+    [ -f "$cand/.agent/contract.json" ] && { wt="$cand"; break; }
+  done
+  [ -n "$wt" ] || die "no contract under $(policy work_dir features)/$task/<repo>. Run: hk new --task $task --repo <R>"
+  local f; f=$(require_contract "$wt")
+  local repo rd b
+  repo=$(jqr '.repo' "$f"); rd=$(repo_dir "$repo"); b=$(jqr '.base_ref' "$f")
+
+  local head; head=$(git -C "$wt" rev-parse HEAD)
+  git -C "$rd" fetch origin >/dev/null 2>&1 || say "fetch failed, checking local refs only"
+  git -C "$rd" merge-base --is-ancestor "$head" "origin/$b" 2>/dev/null \
+    || die "commit ${head:0:12} is not in origin/$b. Merge it first."
+  local localhead remotehead
+  localhead=$(git -C "$rd" rev-parse "$b"); remotehead=$(git -C "$rd" rev-parse "origin/$b")
+  [ "$localhead" = "$remotehead" ] || die "$rd is at ${localhead:0:12}, origin/$b is at ${remotehead:0:12}. Run: hk close --sync"
+  [ -z "$(git -C "$rd" status --porcelain)" ] || die "$rd has uncommitted changes. Clean it first."
+
+  mkdir -p "$(dirname "$(archive_path "$task" "$repo")")"
+  local dest; dest=$(archive_path "$task" "$repo")
+  [ -e "$dest" ] && die "$dest already exists"
+  [ "$apply" -eq 1 ] || { say "dry run. Would run: git -C $rd worktree move $wt $dest"; return 0; }
+
+  # git moves the folder and fixes both sides of the registration. A plain mv does not.
+  git -C "$rd" worktree move "$wt" "$dest" || die "git worktree move failed"
+  ok "moved $wt to $dest"
+}
+
+# ---------------- hk install ----------------
+cmd_install() {
+  local repo="" apply=0 refresh=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="$2"; shift 2 ;;
+      --all) repo="*"; shift ;;
+      --apply) apply=1; shift ;;
+      --refresh) refresh=1; shift ;;
+      *) shift ;;
+    esac
+  done
+  [ -n "$repo" ] || die "usage: hk install --repo <name>|--all [--apply] [--refresh]"
+  local d
+  if [ "$repo" = "*" ]; then
+    for d in "$HK_ROOT"/repos/*/; do install_one "$(basename "${d%/}")" "$apply" "$refresh"; done
+  else
+    install_one "$repo" "$apply" "$refresh"
+  fi
+  harness_note
+}
+
+install_one() { # install_one <repo> <apply> <refresh>
+  local repo="$1" apply="$2" refresh="${3:-0}" rd common hook
+  rd=$(repo_dir "$repo"); [ -d "$rd" ] || { say "skip $repo: no base checkout"; return 0; }
+  if ! common=$(git -C "$rd" rev-parse --git-common-dir 2>/dev/null); then
+    say "skip $repo: not a usable git checkout"; return 0
+  fi
+  case "$common" in /*) : ;; *) common="$rd/$common" ;; esac
+  hook="$common/hooks/pre-commit"
+
+  if [ -e "$hook" ]; then
+    if [ "$refresh" -eq 1 ] && grep -q '^# hk pre-commit check' "$hook"; then
+      install -m 0755 "$HK_DIR/hooks/pre-commit.sh" "$hook" && ok "refreshed $hook"
+      return 0
+    fi
+    say "skip $repo: a pre-commit hook already exists at $hook"
+    say 'add one line to it: exec "$HK_DIR/hooks/pre-commit.sh" "$@"'
+    say "if hk wrote that hook, refresh it: hk install --repo $repo --apply --refresh"
+    return 0
+  fi
+  if [ "$apply" -ne 1 ]; then say "dry run for $repo: would write $hook"; return 0; fi
+  mkdir -p "$common/hooks"
+  install -m 0755 "$HK_DIR/hooks/pre-commit.sh" "$hook" && ok "installed $hook"
+}
+
+harness_note() {
+  cat <<'NOTE'
+Harness hooks are early warning only; the git hook is the rule.
+  Claude Code  ~/.claude/settings.json  PreToolUse, JSON on stdin, exit code 2 blocks the call
+    {"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command",
+      "command":"~/Work/scripts/harness/hooks/claude-pretool.sh","timeout":5}]}]}}
+  pi           ~/.pi/agent/extensions/hk.ts   tool_call returns { block: true, reason }
+  hermes       no hook point here, so the git hook is the only check
+NOTE
+}
+
+# ---------------- hk audit ----------------
+cmd_audit() {
+  local root; root=$(hk_root)
+  local wd; wd=$(policy work_dir features)
+  printf 'standard: %s/%s/<task>/<repo>, branches %s\n' "$root" "$wd" "$(branch_prefixes)"
+  printf 'checks:   shape=%s branch=%s\n\n' "$(policy shape_check warn)" "$(policy branch_check warn)"
+  local d rd b p bad=0
+  for d in "$root"/repos/*/; do
+    rd="${d%/}"; [ -d "$rd" ] || continue
+    while IFS= read -r line; do
+      p=${line%% *}
+      [ "$p" = "$rd" ] && continue                   # the base checkout is allowed
+      b=$(git -C "$p" branch --show-current 2>/dev/null)
+      local why=""
+      shape_ok "$p" || why="path"
+      if [ -n "$b" ] && ! branch_prefix_allowed "$b"; then why="$why${why:+, }branch"; fi
+      if [ -n "$why" ]; then bad=$((bad+1)); printf '  %-8s %s [%s]\n' "$why" "$p" "$b"; fi
+    done < <(git -C "$rd" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}')
+  done
+  [ "$bad" -eq 0 ] && printf '  no violations\n'
+  printf '\n%d worktree(s) break the standard. Repair one with: hk repair <task> --apply\n' "$bad"
+}
+
+# ---------------- hk repair ----------------
+cmd_repair() {
+  local task="" apply=0 newtask=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --apply) apply=1; shift ;;
+      --task) newtask="$2"; shift 2 ;;
+      *) task="$1"; shift ;;
+    esac
+  done
+  [ -n "$task" ] || die "usage: hk repair <task> [--task <new-name>] [--apply]"
+  local root; root=$(hk_root)
+  local wd; wd=$(policy work_dir features)
+  local src="$root/$wd/$task"
+  [ -d "$src" ] || die "no worktree at $src"
+  # A task folder can already hold one folder per repo; then repair that repo folder.
+  if ! git -C "$src" rev-parse --git-common-dir >/dev/null 2>&1; then
+    local found="" c
+    for c in "$src"/*; do
+      [ -d "$c" ] || continue
+      git -C "$c" rev-parse --git-common-dir >/dev/null 2>&1 && { found="$c"; break; }
+    done
+    [ -n "$found" ] || die "no git worktree at $src or under it"
+    src="$found"
+    task="${newtask:-$(basename "$found")}"
+  fi
+  local common repo
+  common=$(git -C "$src" rev-parse --git-common-dir 2>/dev/null) || die "$src is not a git worktree"
+  case "$common" in /*) : ;; *) common="$src/$common" ;; esac
+  repo=$(basename "$(dirname "${common%/}")")   # <root>/repos/<repo>/.git -> <repo>
+  local cur; cur=$(git -C "$src" branch --show-current)
+  [ -n "$cur" ] || die "$src is detached; check out a branch first"
+
+  # Keep a branch that already follows the policy. Only swap the prefix otherwise,
+  # so fix/132-162-partitioned-fk never becomes feat/<folder-name>.
+  local wbr="$cur"
+  if ! branch_prefix_allowed "$cur"; then
+    local name="${cur#*/}" pre="${cur%%/*}" dflt
+    dflt=$(policy branch_default_prefix feat)
+    case "$pre" in fix*) pre=fix ;; chore*) pre=chore ;; *) pre="$dflt" ;; esac
+    wbr="$pre/$name"
+  fi
+
+  # A folder named after the repo is not a task name; take the task from the branch.
+  local task_name="${newtask:-$task}"
+  [ "$task_name" = "$repo" ] && task_name="${wbr#*/}"
+  local want; want=$(worktree_path "$task_name" "$repo")
+  [ "$src" = "$want" ] && [ "$cur" = "$wbr" ] && { ok "$src already matches the standard"; return 0; }
+  say "from  $src [$cur]"
+  say "to    $want [$wbr]"
+  [ "$apply" -eq 1 ] || { say "dry run. Add --apply."; return 0; }
+  # Only move when the path is wrong. A branch-only repair must not touch the folder.
+  if [ "$src" != "$want" ]; then
+    # git cannot move a folder into itself, so the nested shape needs a step aside.
+    local tmp="$(dirname "$src")/.repair-$repo.$$"   # beside the worktree, never inside it
+    local nested=0
+    case "$want" in "$src"/*) nested=1 ;; esac
+    if [ "$nested" -eq 1 ]; then
+      git -C "$root/repos/$repo" worktree move "$src" "$tmp" || die "step aside failed"
+      mkdir -p "$(dirname "$want")"
+      git -C "$root/repos/$repo" worktree move "$tmp" "$want" || die "move into place failed"
+    else
+      mkdir -p "$(dirname "$want")"
+      git -C "$root/repos/$repo" worktree move "$src" "$want" || die "worktree move failed"
+    fi
+  else
+    say "path already correct, only the branch changes"
+  fi
+  if [ "$cur" != "$wbr" ]; then
+    git -C "$root/repos/$repo" branch -m "$cur" "$wbr" 2>/dev/null || die "branch rename failed"
+    git -C "$want" symbolic-ref HEAD "refs/heads/$wbr" 2>/dev/null || true
+  fi
+  ok "repaired to $want on $wbr"
+}
+
+# ---------------- hk policy ----------------
+cmd_policy() {
+  local sub="${1:-get}" k="${2:-}" v="${3:-}"
+  case "$sub" in
+    get) [ -n "$k" ] && policy "$k" || jq . "$HK_POLICY" ;;
+    set) [ -n "$k" ] && [ -n "$v" ] || die "usage: hk policy set <key> <value>"
+         local tmp="$HK_POLICY.tmp"
+         jq --arg k "$k" --arg v "$v" '.[$k] = $v' "$HK_POLICY" > "$tmp" && mv "$tmp" "$HK_POLICY"
+         ok "$k = $v" ;;
+    *) die "usage: hk policy [get <key>|set <key> <value>]" ;;
+  esac
+}
+
+# ---------------- the policy check the hooks call ----------------
+cmd_policy_check() {
+  local wt="${1:-$(git rev-parse --show-toplevel 2>/dev/null)}"
+  [ -n "$wt" ] || return 0
+  policy_check "$wt"
+}
+
+
+# ---------------- hk adopt ----------------
+# One line for Orca's repo setup script, and for any worktree made without hk.
+# It writes the contract for the worktree you are standing in, then reports the standard.
+cmd_adopt() {
+  local wt="${1:-$(git rev-parse --show-toplevel 2>/dev/null)}"
+  [ -n "$wt" ] || die "run this inside a git worktree"
+  local br repo common base base_commit f
+  br=$(git -C "$wt" branch --show-current) || die "no branch in $wt"
+  [ -n "$br" ] || die "$wt is detached; check out a feat, fix or chore branch first"
+  branch_prefix_allowed "$br" || die "branch '$br' must start with $(branch_prefixes)"
+  common=$(git -C "$wt" rev-parse --git-common-dir) || die "no git records for $wt"
+  case "$common" in /*) : ;; *) common="$wt/$common" ;; esac
+  repo=$(basename "$(dirname "${common%/}")")
+  base=$(base_ref_for "$(repo_dir "$repo")")
+  base_commit=$(git -C "$wt" rev-parse "$base" 2>/dev/null || git -C "$wt" rev-parse HEAD)
+  local dflt; dflt=$(default_check_for "$(repo_dir "$repo")")
+  local checks_json='[]'
+  [ -n "$dflt" ] && checks_json=$(printf '%s\n' "$dflt" | jq -R . | jq -s .)
+  mkdir -p "$wt/.agent"
+  exclude_agent_dir "$wt"
+  f=$(contract_of "$wt")
+  if [ -f "$f" ]; then ok "contract already at $f"; return 0; fi
+  jq -n --arg id "${br#*/}" --arg now "$(date -u +%FT%TZ)" --arg repo "$repo" --arg base "$base" \
+    --arg bc "$base_commit" --arg wt "$wt" --arg br "$br" --argjson checks "$checks_json" \
+    --arg maxlines "$(policy max_lines 150)" --arg maxfiles "$(policy max_files 5)" \
+    '{schema_version:"1", task_id:$id, created_at:$now, repo:$repo, base_ref:$base,
+      base_commit:$bc, worktree:$wt, branch:$br, ticket_file:"", allowed_read:[], allowed_write:[],
+      check_commands:$checks, max_lines:($maxlines|tonumber), max_files:($maxfiles|tonumber),
+      timeout_seconds:900, writer_harness:"unknown", adopted:true}' > "$f" || die "could not write $f"
+  ok "contract at $f, check: ${dflt:-none configured}"
+  say "add the write list, or edits cannot be checked: jq '.allowed_write = [\"src/x.py\"]' $f"
+  policy_check "$wt"
+}
+
+
+cmd_status() {
+  local d
+  for d in "$HK_ROOT"/features/*; do
+    [ -d "$d" ] || continue
+    local sub f
+    for f in "$d/.agent/contract.json" "$d/"/.agent/contract.json; do
+      [ -f "$f" ] || continue
+      sub=$(dirname "$f")
+      printf '%-34s receipt=%-8s review=%s\n' "${d#"$HK_ROOT"/}" \
+        "$(jqr '.verdict' "$sub/receipt.json" || echo none)" \
+        "$(jqr '.status' "$sub/review.json" || echo none)"
+      break
+    done
+  done
+}
+
+# ---------------- hk check ----------------
+# The one rule, used by the git hook and by every harness hook.
+cmd_check() {
+  local wt="${1:-$(git rev-parse --show-toplevel 2>/dev/null)}"
+  [ -n "$wt" ] || return 0
+  [ -f "$(contract_of "$wt")" ] || return 0        # plain work, no contract, no rule
+  local r v base want now
+  r=$(receipt_of "$wt"); v=$(review_of "$wt")
+  [ -f "$r" ] || die "no receipt for $wt. Run: cd $wt && hk verify"
+  [ "$(jqr '.verdict' "$r")" = green ] || die "receipt verdict is $(jqr '.verdict' "$r")"
+  base=$(jqr '.base_ref' "$(contract_of "$wt")")
+  want=$(jqr '.diff_hash' "$r")
+  now=$(diff_hash "$wt" "$base")
+  [ "$want" = "$now" ] || die "the diff changed after the receipt (${want:0:12} != ${now:0:12})"
+  [ -f "$v" ] || die "no review.json for $wt. Run: cd $wt && hk review"
+  [ "$(jqr '.status' "$v")" = APPROVED ] || die "review status is $(jqr '.status' "$v")"
+  [ "$(jqr '.reviewed_diff_hash' "$v")" = "$now" ] || die "the review covers a different diff. Run hk review again"
+  ok "diff ${now:0:12} matches the receipt and the review"
+}
+
+case "${1:-}" in
+  new) shift; cmd_new "$@" ;;
+  worker) shift; cmd_worker "$@" ;;
+  verify) shift; cmd_verify "$@" ;;
+  review) shift; cmd_review "$@" ;;
+  close) shift; cmd_close "$@" ;;
+  archive) shift; cmd_archive "$@" ;;
+  install) shift; cmd_install "$@" ;;
+  status) shift; cmd_status ;;
+  adopt) shift; cmd_adopt "${1:-}" ;;
+  audit) shift; cmd_audit ;;
+  repair) shift; cmd_repair "$@" ;;
+  policy) shift; cmd_policy "$@" ;;
+  policy-check) shift; cmd_policy_check "${1:-}" ;;
+  check) shift; if [ -n "${1:-}" ]; then cmd_check "$1"; else cmd_check; fi ;;
+  *) usage ;;
+esac
