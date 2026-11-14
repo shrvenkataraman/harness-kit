@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # hk shared functions. Sourced by `hk` and by the installed git hook.
 # Layout standard (this machine):
-#   $HK_ROOT/repos/<repo>      default branch checkout, read-only for agents
-#   $HK_ROOT/features/<task>   worktree with the agent branch
-#   $HK_ROOT/archives/<task>   worktree after the branch is merged and synced
+#   root         base folder of everything below (policy key, env HK_ROOT wins)
+#   base_dir     default repos/      <repo>  default branch checkout, read-only for agents
+#   work_dir     default features/   <task>  worktree with the agent branch
+#   archive_dir  default archives/   <task>  worktree after the branch is merged and synced
 # Nothing here writes outside the worktree except `hk close --sync` and `hk archive --apply`.
 
 HK_ROOT="${HK_ROOT:-$HOME/Work}"
@@ -37,9 +38,7 @@ task_id_from() { # ticket file path -> short task id
   printf '%s\n' "$b"
 }
 
-repo_dir()  { printf '%s\n' "$HK_ROOT/repos/$1"; }
-feat_dir()  { printf '%s\n' "$HK_ROOT/features/$1"; }
-arch_dir()  { printf '%s\n' "$HK_ROOT/archives/$1"; }
+repo_dir()  { printf '%s\n' "$(hk_root)/$(policy base_dir repos)/$1"; }
 
 # current worktree root, or fail
 require_worktree() {
