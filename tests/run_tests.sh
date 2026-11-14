@@ -7,6 +7,13 @@ HK=${HK:-$(realpath "$(dirname "$0")/../hk")}
 TMP=$(mktemp -d /tmp/hk-test.XXXXXX)
 export HK_ROOT="$TMP/work"
 export HK_DIR="${HK_DIR:-$(dirname "$HK")}"
+# A fixed policy, so the suite never reads the user's ~/.config/hk/policy.json.
+export HK_POLICY="$TMP/policy.json"
+cat > "$HK_POLICY" <<POLICY
+{"root": "$HK_ROOT", "base_dir": "repos", "work_dir": "features", "archive_dir": "archives",
+ "path_shape": "features/<task>/<repo>", "branch_prefixes": ["feat", "fix", "chore"],
+ "branch_default_prefix": "feat", "shape_check": "block", "branch_check": "block"}
+POLICY
 export HK_STUB_CMD="echo 'STATUS: APPROVED'; echo 'checked concurrency and empty input'"
 fails=0
 
