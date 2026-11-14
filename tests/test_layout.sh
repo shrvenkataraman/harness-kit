@@ -48,6 +48,9 @@ else
   pass "AC3: no fixed \$HK_ROOT/(repos|features|archives) in hk, lib.sh"
 fi
 
+# AC1: the main suite still passes with the default layout
+if bash "$(dirname "$0")/run_tests.sh" >/dev/null 2>&1; then echo "PASS  AC1: run_tests.sh passes"; else echo "FAIL  AC1: run_tests.sh failed"; fails=$((fails+1)); fi
+
 rm -rf "$TMP"
 [ "$fails" -eq 0 ] && exit 0
 printf '\n%d check(s) failed\n' "$fails"; exit 1
