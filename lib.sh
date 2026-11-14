@@ -88,6 +88,7 @@ policy() { # policy <key> [default]
   [ -f "$HK_POLICY" ] && v=$(jq -r --arg k "$k" '.[$k] // empty' "$HK_POLICY" 2>/dev/null)
   if [ -n "$v" ]; then printf '%s\n' "$v"; else printf '%s\n' "$d"; fi
 }
+HK_MODEL="${HK_MODEL:-$(policy model qwen3.8-flash-next)}"
 
 policy_list() { # policy_list <key> -> one item per line
   jq -r ".[\"$1\"][]? // empty" "$HK_POLICY" 2>/dev/null
@@ -233,7 +234,7 @@ harness_run() { # harness_run <harness> <mode> <prompt-file> <worktree>
   die "unknown harness: $h (looked in: $(harness_dirs | tr '\n' ' '))"
 }
 
-harness_reviewer() { # default: opencode on qwen3.8-flash-next; HK_REVIEWER overrides; tests set HK_STUB_CMD
+harness_reviewer() { # default: opencode on the default model (HK_MODEL); HK_REVIEWER overrides; tests set HK_STUB_CMD
   . "$HK_DIR/harnesses.d/opencode.sh"
   if [ -n "${HK_STUB_CMD:-}" ]; then printf 'stub\n'; return 0; fi
   if [ -n "${HK_REVIEWER:-}" ]; then printf '%s\n' "$HK_REVIEWER"; return 0; fi
