@@ -77,13 +77,66 @@ on `master`.
 tests/run_tests.sh      # 40 checks, a throwaway repository under /tmp, nothing outside it touched
 ```
 
-## Settings
+## Install
 
-`HK_ROOT` (default `~/Work`), `HK_TIMEOUT` (900), `HK_MAX_LINES` (150), `HK_MAX_FILES` (5),
-`HK_PI_MODEL` (`qwen3.8-flash-next`), `HK_CLAUDE_MODEL` (`qwen3.8-flash-next`), `HK_REVIEW_MODEL` (`qwen3.8-flash-next`), `HK_REVIEW_THINKING` (`low`).
-`HK_REVIEWER` (`opencode`) picks the review harness: `opencode`, `pi` or `claude`.
-The default reviewer runs `llama-swap/qwen3.8-flash-next` with the read-only `plan` agent. `HK_OPENCODE_MODEL` overrides the model,
-`HK_OPENCODE_BIN` the binary (default: PATH, else the newest mise install). Backup: when the first reviewer
-returns no verdict (missing binary, offline, expired auth), `hk review` re-runs on pi with
-`HK_REVIEW_MODEL` (`qwen3.8-flash-next`) and records that harness in `review.json`.
-A `stub` harness exists for tests, so the suite runs with no model call.
+```
+git clone <repo-url> "$HK_ROOT/scripts/harness"
+ln -s "$HK_ROOT/scripts/harness/hk" ~/.local/bin/hk     # any folder on PATH
+hk install --all --apply                                 # write the git pre-commit hook
+```
+
+`hk` needs `git`, `jq` and `python3`. Set `$HK_ROOT` to the folder that holds `repos/`, `features/` and `archives/`.
+
+## Policy keys
+
+`~/.config/hk/policy.json` holds the standard. Read a key with `hk policy get <key>`. Change one with `hk policy set <key> <value>`. A key that is not set uses its default. When a check says `block`, a bad path or branch stops the commit.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `root` | `~/Work` | Base folder of all checkouts. `HK_ROOT` wins when set. |
+| `base_dir` | `repos` | Folder under the root for base checkouts. |
+| `work_dir` | `features` | Folder under the root for task worktrees. |
+| `archive_dir` | `archives` | Folder under the root for finished worktrees. |
+| `branch_default_prefix` | `feat` | Branch prefix when the task name has none. |
+| `shape_check` | `warn` | `warn` or `block` when a worktree is not `<work_dir>/<task>/<repo>`. |
+| `branch_check` | `warn` | `warn` or `block` when a branch prefix is not `feat`, `fix` or `chore`. |
+| `max_lines` | `150` | Default diff line limit written to a new contract. |
+| `max_files` | `5` | Default changed-file limit written to a new contract. |
+| `model` | `qwen3.8-flash-next` | Default model for all harnesses (`HK_MODEL`). |
+
+## Environment variables
+
+Every `HK_*` variable that `hk`, `lib.sh` and `harnesses.d/*.sh` read:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HK_ROOT` | `~/Work` | Base folder of `repos/`, `features/`, `archives/`. |
+| `HK_ROOT_OVERRIDE` | unset | Replaces the root for layout paths; used by tests. |
+| `HK_DIR` | `$HK_ROOT/scripts/harness` | Folder that holds `hk`, `lib.sh`, `harnesses.d` and `hooks`. |
+| `HK_BIN` | real path of `hk` | Set by `hk` itself; the path of the running script. |
+| `HK_VERSION` | `1` | Contract schema version written by `hk`. |
+| `HK_POLICY` | `~/.config/hk/policy.json` | Path of the policy file. |
+| `HK_BASE_REF` | unset | Base ref used when `--base` is absent. |
+| `HK_MODEL` | policy `model` | Default model for every harness. |
+| `HK_TIMEOUT` | `900` | Seconds before a harness run stops. |
+| `HK_MAX_LINES` | `150` | Diff line limit for a new contract. |
+| `HK_MAX_FILES` | `5` | Changed-file limit for a new contract. |
+| `HK_PI_MODEL` | unset | Model for Pi in `work` mode. |
+| `HK_PI_PROVIDER` | `local` | Pi provider in `work` mode. |
+| `HK_PI_THINKING` | `low` | Pi thinking level in `work` mode. |
+| `HK_CLAUDE_MODEL` | `HK_MODEL` | Model for the `claude` harness. |
+| `HK_REVIEW_MODEL` | `HK_MODEL` | Model for Pi in `read` mode and the review fallback. |
+| `HK_REVIEW_THINKING` | `low` | Pi thinking level in `read` mode. |
+| `HK_REVIEWER` | auto | Review harness: `opencode`, `pi` or `claude`. |
+| `HK_OPENCODE_MODEL` | `llama-swap/$HK_MODEL` | Model for the `opencode` harness. |
+| `HK_OPENCODE_BIN` | PATH, then newest mise install | Path of the `opencode` binary. |
+| `HK_HARNESS_DIR` | unset | Extra harness folder, searched first. See `docs/harnesses.md`. |
+| `HK_STUB_CMD` | `echo 'STATUS: APPROVED'` | Command the `stub` harness runs; tests only. |
+| `HK_ALLOW_COMMIT` | unset | `1` skips the commit check for one commit. |
+| `HK_DISABLE` | unset | `1` turns the check off for a command. |
+
+Harness details: `docs/harnesses.md`. Contributing: `CONTRIBUTING.md`.
+
+## License
+
+MIT. See `LICENSE`.
