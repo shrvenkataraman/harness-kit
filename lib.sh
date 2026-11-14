@@ -221,66 +221,21 @@ exclude_agent_dir() { # idempotent append to the repo's shared exclude file
 # at 131072 bytes, and a large branch digest passes that. pi takes a path in
 # --append-system-prompt (docs/cli.md: text or file contents) and claude has
 # --append-system-prompt-file. Both keep the prompt's system-prompt role.
-harness_run() { # harness_run <harness> <mode> <prompt-file> <worktree>
-  local h="$1" mode="$2" pf="$3" wt="$4"
-  local t="${HK_TIMEOUT:-900}"
-  case "$h" in
-    pi)
-      # A reviewer never edits, and always runs on the local provider (localhost:9090/v1).
-      if [ "$mode" = read ]; then
-        # The reviewer model is explicit: qwen3.8-flash-next unless HK_REVIEW_MODEL says otherwise.
-        timeout "$t" pi -p --provider local --model "${HK_REVIEW_MODEL:-qwen3.8-flash-next}" \
-          --thinking "${HK_REVIEW_THINKING:-low}" --no-session --no-skills --no-extensions --no-mcp \
-          --tools read,grep,find,ls --append-system-prompt "$pf" "Do the audit now." </dev/null
-        return
-      fi
-      local pm=(); [ -n "${HK_PI_MODEL:-}" ] && pm=(--model "$HK_PI_MODEL")   # unset: pi's own default model
-      timeout "$t" pi -p --provider "${HK_PI_PROVIDER:-local}" "${pm[@]}" \
-        --thinking "${HK_PI_THINKING:-low}" --no-session --no-skills --no-extensions \
-        --tools read,edit,write,bash --append-system-prompt "$pf" "Do the task now." </dev/null
-      ;;
-    claude)
-      # A worker may edit. A reviewer never may, so it gets read tools only.
-      if [ "$mode" = work ]; then
-        timeout "$t" claude -p --model "${HK_CLAUDE_MODEL:-qwen3.8-flash-next}" --permission-mode acceptEdits \
-          --allowedTools Read Edit Write Bash --append-system-prompt-file "$pf" "Do the task now." </dev/null
-      else
-        timeout "$t" claude -p --model "${HK_CLAUDE_MODEL:-qwen3.8-flash-next}" \
-          --allowedTools Read Grep Glob --append-system-prompt-file "$pf" "Do the audit now." </dev/null
-      fi
-      ;;
-    opencode)
-      # A reviewer never edits: the plan agent is read-only. The default model is opencode-hosted
-      # (llama-swap/qwen3.8-flash-next), the one local model.
-      # opencode has no system-prompt flag, so the prompt file is read from disk by the agent.
-      local obin; obin=$(opencode_bin) || die "opencode is not installed (HK_OPENCODE_BIN points to it)"
-      local oa=plan; [ "$mode" = work ] && oa=build
-      timeout "$t" "$obin" run --agent "$oa" \
-        -m "${HK_OPENCODE_MODEL:-llama-swap/qwen3.8-flash-next}" --auto --archived \
-        "Read the file $pf. It is your full task. Follow it exactly, then answer." </dev/null
-      ;;
-    hermes)
-      say "hermes has no headless one-shot mode here; run: hermes --continue <name> in $wt"
-      return 127
-      ;;
-    stub)
-      # Tests only. Lets the whole flow run without spending a model call.
-      eval "${HK_STUB_CMD:-echo 'STATUS: APPROVED'}"
-      ;;
-    *) die "unknown harness: $h (pi, claude, hermes, stub)" ;;
-  esac
+harness_dirs() { # search order: $HK_HARNESS_DIR, user dir, built-in
+  [ -n "${HK_HARNESS_DIR:-}" ] && printf '%s\n' "$HK_HARNESS_DIR"
+  printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/hk/harnesses.d" "$HK_DIR/harnesses.d"
 }
-
-opencode_bin() { # HK_OPENCODE_BIN wins; then PATH; then the newest mise install
-  [ -n "${HK_OPENCODE_BIN:-}" ] && { printf '%s\n' "$HK_OPENCODE_BIN"; return 0; }
-  command -v opencode >/dev/null 2>&1 && { command -v opencode; return 0; }
-  local newest
-  newest=$(ls -d "$HOME"/.local/share/mise/installs/opencode/*/node_modules/.bin/opencode 2>/dev/null | sort -V | tail -1)
-  [ -n "$newest" ] && { printf '%s\n' "$newest"; return 0; }
-  return 1
+harness_run() { # harness_run <harness> <mode> <prompt-file> <worktree>
+  local h="$1" d
+  case "$h" in *[!a-z0-9_-]*|'') die "bad harness name: $h" ;; esac
+  for d in $(harness_dirs); do
+    if [ -f "$d/$h.sh" ]; then . "$d/$h.sh"; "harness_${h//-/_}" "$2" "$3" "$4"; return; fi
+  done
+  die "unknown harness: $h (looked in: $(harness_dirs | tr '\n' ' '))"
 }
 
 harness_reviewer() { # default: opencode on qwen3.8-flash-next; HK_REVIEWER overrides; tests set HK_STUB_CMD
+  . "$HK_DIR/harnesses.d/opencode.sh"
   if [ -n "${HK_STUB_CMD:-}" ]; then printf 'stub\n'; return 0; fi
   if [ -n "${HK_REVIEWER:-}" ]; then printf '%s\n' "$HK_REVIEWER"; return 0; fi
   opencode_bin >/dev/null 2>&1 && { printf 'opencode\n'; return 0; }
