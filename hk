@@ -352,7 +352,7 @@ cmd_install() {
   [ -n "$repo" ] || die "usage: hk install --repo <name>|--all [--apply] [--refresh]"
   local d
   if [ "$repo" = "*" ]; then
-    for d in "$HK_ROOT"/repos/*/; do install_one "$(basename "${d%/}")" "$apply" "$refresh"; done
+    for d in "$(hk_root)/$(policy base_dir repos)"/*/; do install_one "$(basename "${d%/}")" "$apply" "$refresh"; done
   else
     install_one "$repo" "$apply" "$refresh"
   fi
@@ -401,7 +401,7 @@ cmd_audit() {
   printf 'standard: %s/%s/<task>/<repo>, branches %s\n' "$root" "$wd" "$(branch_prefixes)"
   printf 'checks:   shape=%s branch=%s\n\n' "$(policy shape_check warn)" "$(policy branch_check warn)"
   local d rd b p bad=0
-  for d in "$root"/repos/*/; do
+  for d in "$root/$(policy base_dir repos)"/*/; do
     rd="${d%/}"; [ -d "$rd" ] || continue
     while IFS= read -r line; do
       p=${line%% *}
@@ -475,18 +475,18 @@ cmd_repair() {
     local nested=0
     case "$want" in "$src"/*) nested=1 ;; esac
     if [ "$nested" -eq 1 ]; then
-      git -C "$root/repos/$repo" worktree move "$src" "$tmp" || die "step aside failed"
+      git -C "$(repo_dir "$repo")" worktree move "$src" "$tmp" || die "step aside failed"
       mkdir -p "$(dirname "$want")"
-      git -C "$root/repos/$repo" worktree move "$tmp" "$want" || die "move into place failed"
+      git -C "$(repo_dir "$repo")" worktree move "$tmp" "$want" || die "move into place failed"
     else
       mkdir -p "$(dirname "$want")"
-      git -C "$root/repos/$repo" worktree move "$src" "$want" || die "worktree move failed"
+      git -C "$(repo_dir "$repo")" worktree move "$src" "$want" || die "worktree move failed"
     fi
   else
     say "path already correct, only the branch changes"
   fi
   if [ "$cur" != "$wbr" ]; then
-    git -C "$root/repos/$repo" branch -m "$cur" "$wbr" 2>/dev/null || die "branch rename failed"
+    git -C "$(repo_dir "$repo")" branch -m "$cur" "$wbr" 2>/dev/null || die "branch rename failed"
     git -C "$want" symbolic-ref HEAD "refs/heads/$wbr" 2>/dev/null || true
   fi
   ok "repaired to $want on $wbr"
@@ -550,13 +550,13 @@ cmd_adopt() {
 
 cmd_status() {
   local d
-  for d in "$HK_ROOT"/features/*; do
+  for d in "$(hk_root)/$(policy work_dir features)"/*; do
     [ -d "$d" ] || continue
     local sub f
-    for f in "$d/.agent/contract.json" "$d/"/.agent/contract.json; do
+    for f in "$d/.agent/contract.json" "$d"/*/.agent/contract.json; do
       [ -f "$f" ] || continue
       sub=$(dirname "$f")
-      printf '%-34s receipt=%-8s review=%s\n' "${d#"$HK_ROOT"/}" \
+      printf '%-34s receipt=%-8s review=%s\n' "${d#"$(hk_root)"/}" \
         "$(jqr '.verdict' "$sub/receipt.json" || echo none)" \
         "$(jqr '.status' "$sub/review.json" || echo none)"
       break
